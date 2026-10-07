@@ -139,7 +139,7 @@ def huffman_decode(data):
 def huffman_length(text):
     """Return how many octets the Huffman encoding of text takes."""
     bits = sum(_HUFFMAN[octet][1] for octet in text.encode("utf-8"))
-    return bits // 8 + 1
+    return (bits + 7) // 8
 
 # -- Integers and strings (RFC 7541 sections 5.1 and 5.2) -------------------
 
@@ -216,7 +216,11 @@ class DynamicTable:
     def add(self, name, value):
         """Put a field in the table, dropping what no longer fits."""
         entry_size = len(name) + len(value) + ENTRY_OVERHEAD
-        while self.entries and self.size + entry_size >= self.max_size:
+        if entry_size > self.max_size:
+            while self.entries:
+                self.evict_oldest()
+            return
+        while self.entries and self.size + entry_size > self.max_size:
             self.evict_oldest()
         self.entries.append((name, value))
         self.size += entry_size
@@ -261,10 +265,10 @@ class Decoder:
                 size, offset = read_integer(block, offset, 5)
                 self._resize(size)
             elif octet & 0x10:
-                field, offset = self._literal(block, offset, 5, False)
+                field, offset = self._literal(block, offset, 4, False)
                 headers.append(field)
             else:
-                field, offset = self._literal(block, offset, 4, True)
+                field, offset = self._literal(block, offset, 4, False)
                 headers.append(field)
         return headers
 
@@ -277,7 +281,7 @@ class Decoder:
         position = index - len(STATIC_TABLE)
         if position > len(self.table.entries):
             raise HPACKError("table index %d is out of range" % index)
-        return self.table.entries[position - 1]
+        return self.table.entries[-position]
 
     def _literal(self, block, offset, prefix_bits, indexed):
         """Read a literal field, adding it to the table when indexed."""
@@ -293,8 +297,12 @@ class Decoder:
 
     def _resize(self, size):
         """Make a size update from the peer take effect."""
+        if size > self.limit:
+            raise HPACKError(
+                "a size update of %d passes the limit of %d" % (size, self.limit)
+            )
         self.table.max_size = size
-        if self.table.size > self.table.max_size:
+        while self.table.entries and self.table.size > self.table.max_size:
             self.table.evict_oldest()
 
 # -- Encoding ---------------------------------------------------------------
@@ -328,6 +336,9 @@ class Encoder:
         for index, entry in enumerate(STATIC_TABLE, 1):
             if entry == (name, value):
                 return index
+        for position, entry in enumerate(reversed(self.table.entries), 1):
+            if entry == (name, value):
+                return len(STATIC_TABLE) + position
         return None
 
     def _incremental(self, name, value):
